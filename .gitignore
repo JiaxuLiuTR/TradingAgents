@@ -221,3 +221,8 @@ __marimo__/
 # Enterprise env file (secrets) and generated run reports
 .env.enterprise
 reports/
+
+# Corporate CA bundle + local Compose override for running behind the
+# Thomson Reuters / Zscaler TLS-inspecting proxy (machine-specific).
+certs/
+docker-compose.override.yml
