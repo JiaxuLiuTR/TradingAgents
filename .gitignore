@@ -225,7 +225,7 @@ reports/
 # Corporate CA bundle + local Compose override for running behind the
 # Thomson Reuters / Zscaler TLS-inspecting proxy (machine-specific).
 certs/
-docker-compose.override.yml
+# docker-compose.override.yml
 
 # Run outputs redirected to the host by docker-compose.override.yml
 output/

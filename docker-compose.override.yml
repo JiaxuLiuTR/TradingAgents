@@ -1,0 +1,55 @@
+# Local-only overrides for running behind the Thomson Reuters / Zscaler
+# TLS-inspecting proxy.
+#
+# Zscaler re-signs some HTTPS endpoints (e.g. https://fc.yahoo.com, which
+# yfinance hits to bootstrap its cookie/crumb) with the Thomson Reuters
+# internal root CA. The container's default certifi bundle only trusts public
+# roots, so those requests fail with: curl (60) SSL certificate problem:
+# unable to get local issuer certificate.
+#
+# We mount a combined CA bundle (public certifi roots + corporate roots) over
+# certifi's bundle and point the common SSL env vars at it, so every HTTP
+# client in the container (curl_cffi, requests, httpx, urllib) trusts both
+# public sites and Zscaler-intercepted ones.
+#
+# Regenerate certs/cacert-combined.pem when the corporate CA rotates:
+#   security find-certificate -a -p /Library/Keychains/System.keychain > all.pem
+#   (extract Thomson Reuters / Zscaler CA certs -> certs/corporate-root-ca.pem)
+#   docker compose run --rm -T --entrypoint python tradingagents \
+#     -c "import certifi,sys;sys.stdout.write(open(certifi.where()).read())" \
+#     | awk '/BEGIN CERTIFICATE/{p=1} p' > base.pem
+#   cat base.pem certs/corporate-root-ca.pem > certs/cacert-combined.pem
+#
+# This file and certs/ are gitignored (machine-specific, not for sharing).
+#
+# --- Output location ---------------------------------------------------------
+# By default the app saves to two places inside the container:
+#   1. auto per-section reports + logs -> ~/.tradingagents/logs/<ticker>/<date>/
+#      (this lived in the tradingagents_data named volume: not browsable on the
+#       host), and
+#   2. the final consolidated report ("Save report?" prompt) -> <cwd>/reports
+#      = /home/appuser/app/reports (ephemeral: lost when --rm removes the run).
+# The two bind mounts below redirect BOTH into ./output on the Mac, so every
+# artifact is directly visible at TradingAgents/output/ and survives the run.
+# To save somewhere else, change the host side (left of the colon) of the
+# ./output mounts, or set TRADINGAGENTS_RESULTS_DIR / _CACHE_DIR /
+# _MEMORY_LOG_PATH in the environment block to a path under a mounted dir.
+services:
+  tradingagents:
+    volumes:
+      - ./certs/cacert-combined.pem:/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem:ro
+      # Auto outputs: logs/, per-section reports/, memory/, cache/ on the host.
+      - ./output:/home/appuser/.tradingagents
+      # Final consolidated report (prompt default is <cwd>/reports). Same host
+      # folder, so accepting the default save lands in ./output/<ticker>_<ts>/.
+      - ./output:/home/appuser/app/reports
+    environment:
+      - CURL_CA_BUNDLE=/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem
+      - REQUESTS_CA_BUNDLE=/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem
+      - SSL_CERT_FILE=/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem
+      # Output paths (these match the ./output bind mounts above; the first is
+      # also the built-in default). Change them to relocate within a mounted
+      # dir without touching code.
+      - TRADINGAGENTS_RESULTS_DIR=/home/appuser/.tradingagents/logs
+      - TRADINGAGENTS_CACHE_DIR=/home/appuser/.tradingagents/cache
+      - TRADINGAGENTS_MEMORY_LOG_PATH=/home/appuser/.tradingagents/memory/trading_memory.md
