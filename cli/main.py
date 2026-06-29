@@ -19,8 +19,10 @@ from rich.table import Table
 from rich.text import Text
 
 from cli.announcements import display_announcements, fetch_announcements
+from cli.models import AnalystType
 from cli.stats_handler import StatsCallbackHandler
 from cli.utils import (
+    ANALYST_ORDER as _ANALYST_CHOICES,
     ask_anthropic_effort,
     ask_gemini_thinking_config,
     ask_glm_region,
@@ -31,7 +33,10 @@ from cli.utils import (
     confirm_ollama_endpoint,
     detect_asset_type,
     ensure_api_key,
+    filter_analysts_for_asset_type,
     get_ticker,
+    is_valid_ticker_input,
+    normalize_ticker_symbol,
     prompt_openai_compatible_url,
     resolve_backend_url,
     select_analysts,
@@ -479,8 +484,22 @@ def update_display(layout, spinner_text=None, stats_handler=None, start_time=Non
     layout["footer"].update(Panel(stats_table, border_style="grey50"))
 
 
-def get_user_selections():
-    """Get all user selections before starting the analysis display."""
+def get_user_selections(
+    ticker=None,
+    date=None,
+    analysts=None,
+    research_depth=None,
+    language=None,
+    non_interactive=False,
+):
+    """Get all user selections before starting the analysis display.
+
+    When ``ticker`` / ``date`` / ``analysts`` / ``research_depth`` / ``language``
+    are supplied (from the matching CLI options) that step is skipped and the
+    provided value is used. When ``non_interactive`` is True every remaining step
+    the user did not pin via a ``TRADINGAGENTS_*`` env var or a flag falls back to
+    its default instead of prompting, so the whole run is unattended.
+    """
     # Display ASCII art welcome message
     with open(Path(__file__).parent / "static" / "welcome.txt", encoding="utf-8") as f:
         welcome_ascii = f.read()
@@ -533,14 +552,18 @@ def get_user_selections():
         return prompt_fn()
 
     # Step 1: Ticker symbol
-    console.print(
-        create_question_box(
-            "Step 1: Ticker Symbol",
-            "Enter the ticker, with exchange suffix when needed (e.g. SPY, 0700.HK, BTC-USD)",
-            "SPY",
+    if ticker is not None:
+        selected_ticker = _resolve_cli_ticker(ticker)
+        console.print(f"[green]✓ Ticker from command line:[/green] {selected_ticker}")
+    else:
+        console.print(
+            create_question_box(
+                "Step 1: Ticker Symbol",
+                "Enter the ticker, with exchange suffix when needed (e.g. SPY, 0700.HK, BTC-USD)",
+                "SPY",
+            )
         )
-    )
-    selected_ticker = get_ticker()
+        selected_ticker = get_ticker()
     asset_type = detect_asset_type(selected_ticker)
     # Only announce when it's not the default stock path, to avoid printing
     # "stock" on every run.
@@ -550,21 +573,43 @@ def get_user_selections():
         )
 
     # Step 2: Analysis date
-    default_date = datetime.datetime.now().strftime("%Y-%m-%d")
-    console.print(
-        create_question_box(
-            "Step 2: Analysis Date",
-            "Enter the analysis date (YYYY-MM-DD)",
-            default_date,
+    if date is not None:
+        analysis_date = _resolve_cli_date(date)
+        console.print(
+            f"[green]✓ Analysis date from command line:[/green] {analysis_date}"
         )
-    )
-    analysis_date = get_analysis_date()
+    elif non_interactive:
+        analysis_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        console.print(
+            f"[green]✓ Analysis date (default = today):[/green] {analysis_date}"
+        )
+    else:
+        default_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        console.print(
+            create_question_box(
+                "Step 2: Analysis Date",
+                "Enter the analysis date (YYYY-MM-DD)",
+                default_date,
+            )
+        )
+        analysis_date = get_analysis_date()
 
-    # Step 3: Output language (skipped when set via TRADINGAGENTS_OUTPUT_LANGUAGE)
-    if os.environ.get("TRADINGAGENTS_OUTPUT_LANGUAGE"):
+    # Step 3: Output language (skipped when set via --language or
+    # TRADINGAGENTS_OUTPUT_LANGUAGE)
+    if language is not None:
+        output_language = _resolve_cli_language(language)
+        console.print(
+            f"[green]✓ Output language from command line:[/green] {output_language}"
+        )
+    elif os.environ.get("TRADINGAGENTS_OUTPUT_LANGUAGE"):
         output_language = DEFAULT_CONFIG["output_language"]
         console.print(
             f"[green]✓ Output language from environment:[/green] {output_language}"
+        )
+    elif non_interactive:
+        output_language = DEFAULT_CONFIG["output_language"]
+        console.print(
+            f"[green]✓ Output language (default):[/green] {output_language}"
         )
     else:
         console.print(
@@ -576,29 +621,50 @@ def get_user_selections():
         output_language = ask_output_language()
 
     # Step 4: Select analysts
-    console.print(
-        create_question_box(
-            "Step 4: Analysts Team", "Select your LLM analyst agents for the analysis"
+    if analysts is not None:
+        selected_analysts = _resolve_cli_analysts(analysts, asset_type)
+        console.print("[green]✓ Analysts from command line[/green]")
+    elif non_interactive:
+        selected_analysts = filter_analysts_for_asset_type(
+            [value for _, value in _ANALYST_CHOICES], asset_type
         )
-    )
-    selected_analysts = select_analysts(asset_type)
+        console.print("[green]✓ Analysts (default = all available)[/green]")
+    else:
+        console.print(
+            create_question_box(
+                "Step 4: Analysts Team", "Select your LLM analyst agents for the analysis"
+            )
+        )
+        selected_analysts = select_analysts(asset_type)
     console.print(
         f"[green]Selected analysts:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
     )
 
-    # Step 5: Research depth (skipped when both round counts are set via env).
-    # Research depth maps to the debate + risk round counts; when both are
-    # supplied through TRADINGAGENTS_MAX_DEBATE_ROUNDS / _MAX_RISK_ROUNDS we keep
-    # the run non-interactive and honor the env values (#977).
+    # Step 5: Research depth (skipped when set via --research-depth, or when both
+    # round counts are set via env). Research depth maps to the debate + risk
+    # round counts; an explicit --research-depth flag wins over everything, then
+    # env (TRADINGAGENTS_MAX_DEBATE_ROUNDS / _MAX_RISK_ROUNDS), then the default.
     depth_from_env = bool(os.environ.get("TRADINGAGENTS_MAX_DEBATE_ROUNDS")) and bool(
         os.environ.get("TRADINGAGENTS_MAX_RISK_ROUNDS")
     )
-    if depth_from_env:
+    research_depth_explicit = research_depth is not None
+    if research_depth_explicit:
+        selected_research_depth = research_depth
+        console.print(
+            f"[green]✓ Research depth from command line:[/green] "
+            f"{research_depth} debate / {research_depth} risk rounds"
+        )
+    elif depth_from_env:
         selected_research_depth = DEFAULT_CONFIG["max_debate_rounds"]
         console.print(
             f"[green]✓ Research depth from environment:[/green] "
             f"{DEFAULT_CONFIG['max_debate_rounds']} debate / "
             f"{DEFAULT_CONFIG['max_risk_discuss_rounds']} risk rounds"
+        )
+    elif non_interactive:
+        selected_research_depth = 1
+        console.print(
+            "[green]✓ Research depth (default = shallow: 1 debate / 1 risk round)[/green]"
         )
     else:
         console.print(
@@ -613,12 +679,13 @@ def get_user_selections():
     # otherwise the provider's default endpoint — the same value the menu
     # would have picked.
     provider_from_env = bool(os.environ.get("TRADINGAGENTS_LLM_PROVIDER"))
-    if provider_from_env:
+    if provider_from_env or non_interactive:
         selected_llm_provider = DEFAULT_CONFIG["llm_provider"].lower()
         backend_url = resolve_backend_url(
             selected_llm_provider, env_url=DEFAULT_CONFIG["backend_url"]
         )
-        console.print(f"[green]✓ LLM provider from environment:[/green] {selected_llm_provider}")
+        source = "environment" if provider_from_env else "default"
+        console.print(f"[green]✓ LLM provider from {source}:[/green] {selected_llm_provider}")
         console.print(f"[green]✓ Backend URL:[/green] {backend_url}")
         # Still confirm/persist the API key so the run doesn't fail later.
         ensure_api_key(selected_llm_provider)
@@ -662,11 +729,15 @@ def get_user_selections():
         ensure_api_key(selected_llm_provider)
 
     # Step 7: Thinking agents (skipped when either model is set via environment)
-    if os.environ.get("TRADINGAGENTS_QUICK_THINK_LLM") or os.environ.get("TRADINGAGENTS_DEEP_THINK_LLM"):
+    if (
+        os.environ.get("TRADINGAGENTS_QUICK_THINK_LLM")
+        or os.environ.get("TRADINGAGENTS_DEEP_THINK_LLM")
+        or non_interactive
+    ):
         selected_shallow_thinker = DEFAULT_CONFIG["quick_think_llm"]
         selected_deep_thinker = DEFAULT_CONFIG["deep_think_llm"]
         console.print(
-            f"[green]✓ Thinking agents from environment:[/green] "
+            f"[green]✓ Thinking agents:[/green] "
             f"quick={selected_shallow_thinker}, deep={selected_deep_thinker}"
         )
     else:
@@ -688,7 +759,7 @@ def get_user_selections():
     anthropic_effort = None
 
     provider_lower = selected_llm_provider.lower()
-    if provider_from_env:
+    if provider_from_env or non_interactive:
         thinking_level = DEFAULT_CONFIG["google_thinking_level"]
         reasoning_effort = DEFAULT_CONFIG["openai_reasoning_effort"]
         anthropic_effort = DEFAULT_CONFIG["anthropic_effort"]
@@ -717,6 +788,7 @@ def get_user_selections():
         "analysis_date": analysis_date,
         "analysts": selected_analysts,
         "research_depth": selected_research_depth,
+        "research_depth_explicit": research_depth_explicit,
         "llm_provider": selected_llm_provider.lower(),
         "backend_url": backend_url,
         "shallow_thinker": selected_shallow_thinker,
@@ -745,6 +817,123 @@ def get_analysis_date():
             console.print(
                 "[red]Error: Invalid date format. Please use YYYY-MM-DD[/red]"
             )
+
+
+def _resolve_cli_ticker(ticker: str) -> str:
+    """Validate and normalize a ``--ticker`` value, exiting cleanly on error.
+
+    Mirrors the interactive ``get_ticker`` validation/normalization so a
+    command-line symbol is treated identically to a typed one (empty -> SPY).
+    """
+    if not is_valid_ticker_input(ticker):
+        console.print(
+            f"[red]Error: '{ticker}' is not a valid ticker symbol. Use letters/"
+            f"digits and . _ - ^ = (e.g. SPCX, 0700.HK, BTC-USD).[/red]"
+        )
+        raise typer.Exit(code=1)
+    return normalize_ticker_symbol(ticker) if ticker.strip() else "SPY"
+
+
+def _resolve_cli_date(date: str) -> str:
+    """Validate a ``--date`` value (YYYY-MM-DD, not future), exiting on error."""
+    try:
+        parsed = datetime.datetime.strptime(date.strip(), "%Y-%m-%d")
+    except ValueError:
+        console.print(
+            f"[red]Error: invalid date '{date}'. Use YYYY-MM-DD (e.g. 2026-06-28).[/red]"
+        )
+        raise typer.Exit(code=1) from None
+    if parsed.date() > datetime.datetime.now().date():
+        console.print("[red]Error: analysis date cannot be in the future.[/red]")
+        raise typer.Exit(code=1)
+    return date.strip()
+
+
+# Friendly research-depth keywords -> debate/risk round counts. These mirror the
+# interactive picker (Shallow/Medium/Deep) so the flag and the menu agree.
+_RESEARCH_DEPTH_ALIASES = {"shallow": 1, "medium": 3, "deep": 5}
+
+
+def _resolve_cli_research_depth(value: str) -> int:
+    """Resolve a ``--research-depth`` value to a round count, exiting on error.
+
+    Accepts the keywords ``shallow`` / ``medium`` / ``deep`` (1 / 3 / 5 rounds)
+    or any positive integer for a custom number of debate + risk rounds.
+    """
+    v = value.strip().lower()
+    if v in _RESEARCH_DEPTH_ALIASES:
+        return _RESEARCH_DEPTH_ALIASES[v]
+    try:
+        n = int(v)
+    except ValueError:
+        console.print(
+            "[red]Error: --research-depth must be 'shallow', 'medium', 'deep', "
+            "or a positive integer.[/red]"
+        )
+        raise typer.Exit(code=1) from None
+    if n < 1:
+        console.print("[red]Error: --research-depth must be >= 1.[/red]")
+        raise typer.Exit(code=1)
+    return n
+
+
+def _resolve_cli_analysts(analysts: str, asset_type) -> list[AnalystType]:
+    """Resolve a comma-separated ``--analysts`` value to AnalystType list.
+
+    Validates each token against the available analysts and preserves the
+    canonical order. Crypto auto-drops the fundamentals analyst (no fundamentals
+    feed for coins), matching the interactive flow; an explicit but unavailable
+    request is reported rather than silently honored.
+    """
+    by_value = {a.value: a for a in AnalystType}
+    requested: list[AnalystType] = []
+    for token in analysts.split(","):
+        key = token.strip().lower()
+        if not key:
+            continue
+        if key not in by_value:
+            console.print(
+                f"[red]Error: unknown analyst '{key}'. Choose from: "
+                f"{', '.join(by_value)}.[/red]"
+            )
+            raise typer.Exit(code=1)
+        if by_value[key] not in requested:
+            requested.append(by_value[key])
+
+    if not requested:
+        console.print(
+            "[red]Error: --analysts was empty. Provide a comma-separated list, "
+            "e.g. market,news,fundamentals.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    available = filter_analysts_for_asset_type(requested, asset_type)
+    dropped = [a.value for a in requested if a not in available]
+    if dropped:
+        console.print(
+            f"[yellow]Note: {', '.join(dropped)} not available for "
+            f"{asset_type.value}; skipping.[/yellow]"
+        )
+    if not available:
+        console.print(
+            f"[red]Error: none of the requested analysts are available for "
+            f"{asset_type.value}.[/red]"
+        )
+        raise typer.Exit(code=1)
+    # Preserve canonical ANALYST_ORDER rather than user-supplied order.
+    return [a for _, a in _ANALYST_CHOICES if a in available]
+
+
+def _resolve_cli_language(language: str) -> str:
+    """Validate a ``--language`` value, exiting on empty input."""
+    lang = language.strip()
+    if not lang:
+        console.print(
+            "[red]Error: --language was empty. Pass a language name, "
+            "e.g. English, Chinese, Spanish.[/red]"
+        )
+        raise typer.Exit(code=1)
+    return lang
 
 
 def save_report_to_disk(final_state, ticker: str, save_path: Path):
@@ -965,12 +1154,14 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     value on DEFAULT_CONFIG is preserved unless the user overrode it on the CLI.
     """
     config = DEFAULT_CONFIG.copy()
-    # Research depth sets both round counts, but an explicit env override
-    # (TRADINGAGENTS_MAX_DEBATE_ROUNDS / _MAX_RISK_ROUNDS) wins over the
-    # interactive selection — leave the env-applied value in place (#977).
-    if not os.environ.get("TRADINGAGENTS_MAX_DEBATE_ROUNDS"):
+    # Research depth sets both round counts. Precedence: an explicit
+    # --research-depth flag wins, then an env override
+    # (TRADINGAGENTS_MAX_DEBATE_ROUNDS / _MAX_RISK_ROUNDS), then the interactive
+    # selection — the env-applied value is otherwise left in place (#977).
+    depth_explicit = selections.get("research_depth_explicit", False)
+    if depth_explicit or not os.environ.get("TRADINGAGENTS_MAX_DEBATE_ROUNDS"):
         config["max_debate_rounds"] = selections["research_depth"]
-    if not os.environ.get("TRADINGAGENTS_MAX_RISK_ROUNDS"):
+    if depth_explicit or not os.environ.get("TRADINGAGENTS_MAX_RISK_ROUNDS"):
         config["max_risk_discuss_rounds"] = selections["research_depth"]
     config["quick_think_llm"] = selections["shallow_thinker"]
     config["deep_think_llm"] = selections["deep_thinker"]
@@ -988,9 +1179,28 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     return config
 
 
-def run_analysis(checkpoint: bool | None = None):
+def run_analysis(
+    checkpoint: bool | None = None,
+    ticker: str | None = None,
+    date: str | None = None,
+    analysts: str | None = None,
+    research_depth: int | None = None,
+    language: str | None = None,
+):
+    # Passing a ticker on the command line turns the whole run unattended:
+    # every step the user didn't pin via a TRADINGAGENTS_* env var or a flag
+    # uses its default, and the post-run save/display prompts are auto-confirmed.
+    non_interactive = ticker is not None
+
     # First get all user selections
-    selections = get_user_selections()
+    selections = get_user_selections(
+        ticker=ticker,
+        date=date,
+        analysts=analysts,
+        research_depth=research_depth,
+        language=language,
+        non_interactive=non_interactive,
+    )
 
     config = _build_run_config(selections, checkpoint)
 
@@ -1240,15 +1450,29 @@ def run_analysis(checkpoint: bool | None = None):
 
         update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
-    # Post-analysis prompts (outside Live context for clean interaction)
+    # Post-analysis prompts (outside Live context for clean interaction). In
+    # non-interactive mode the report is auto-saved to the default path and the
+    # on-screen display is skipped, so the run never blocks on input.
     console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
     console.print(f"[dim]{analyst_wall_time_tracker.format_summary()}[/dim]")
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_path = Path.cwd() / "reports" / f"{selections['ticker']}_{timestamp}"
+
+    if non_interactive:
+        try:
+            report_file = save_report_to_disk(
+                final_state, selections["ticker"], default_path
+            )
+            console.print(f"\n[green]✓ Report saved to:[/green] {default_path.resolve()}")
+            console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
+        except Exception as e:
+            console.print(f"[red]Error saving report: {e}[/red]")
+        return
 
     # Prompt to save report
     save_choice = typer.prompt("Save report?", default="Y").strip().upper()
     if save_choice in ("Y", "YES", ""):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_path = Path.cwd() / "reports" / f"{selections['ticker']}_{timestamp}"
         save_path_str = typer.prompt(
             "Save path (press Enter for default)",
             default=str(default_path)
@@ -1269,6 +1493,45 @@ def run_analysis(checkpoint: bool | None = None):
 
 @app.command()
 def analyze(
+    ticker: str | None = typer.Option(
+        None,
+        "--ticker",
+        "-t",
+        help="Ticker symbol to analyze (e.g. SPCX, 0700.HK, BTC-USD). Passing "
+        "this runs the whole pipeline non-interactively: every other step uses "
+        "its default (or its TRADINGAGENTS_* env value) and the report is "
+        "auto-saved, so no prompts appear.",
+    ),
+    date: str | None = typer.Option(
+        None,
+        "--date",
+        "-d",
+        help="Analysis date as YYYY-MM-DD. Defaults to today when omitted. Only "
+        "used together with --ticker for an unattended run.",
+    ),
+    analysts: str | None = typer.Option(
+        None,
+        "--analysts",
+        "-a",
+        help="Comma-separated analyst team to run: market, social, news, "
+        "fundamentals (e.g. -a market,news). Omit to use all available. Crypto "
+        "tickers automatically drop the fundamentals analyst.",
+    ),
+    research_depth: str | None = typer.Option(
+        None,
+        "--research-depth",
+        "-r",
+        help="Research depth: shallow (1), medium (3), or deep (5) debate + risk "
+        "rounds; a positive integer also works for a custom count. Higher = more "
+        "thorough but slower and more tokens.",
+    ),
+    language: str | None = typer.Option(
+        None,
+        "--language",
+        "-l",
+        help="Output language for reports and the final decision (e.g. English, "
+        "Chinese, Spanish). Defaults to English.",
+    ),
     checkpoint: bool | None = typer.Option(
         None,
         "--checkpoint/--no-checkpoint",
@@ -1285,7 +1548,17 @@ def analyze(
         from tradingagents.graph.checkpointer import clear_all_checkpoints
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
-    run_analysis(checkpoint=checkpoint)
+    resolved_depth = (
+        _resolve_cli_research_depth(research_depth) if research_depth is not None else None
+    )
+    run_analysis(
+        checkpoint=checkpoint,
+        ticker=ticker,
+        date=date,
+        analysts=analysts,
+        research_depth=resolved_depth,
+        language=language,
+    )
 
 
 if __name__ == "__main__":
