@@ -59,6 +59,7 @@ All options belong to the default command, so they work whether you call
 | `--research-depth` | `-r` | depth | `shallow` (1), `medium` (3), `deep` (5) debate + risk rounds. A positive integer sets a custom count. Higher is more thorough but slower. |
 | `--language` | `-l` | name | Output language for reports and the decision (e.g. `English`, `Chinese`, `Spanish`). Defaults to English. |
 | `--checkpoint` / `--no-checkpoint` | | flag | Enable or disable checkpoint-resume (save state after each node so a crashed run can resume). Omit to honor `TRADINGAGENTS_CHECKPOINT_ENABLED`. |
+| `--save` / `--no-save` | | flag | Save or skip the final consolidated report. Omit to auto-save in unattended `--ticker` runs, or to ask in interactive runs. |
 | `--clear-checkpoints` | | flag | Delete all saved checkpoints before running (force a fresh start). |
 | `--help` | | | Show all options and exit. |
 
@@ -96,6 +97,9 @@ docker compose run --rm tradingagents -t BTC-USD -l Chinese -r medium
 
 # Historical date, fresh start (ignore any saved checkpoints)
 docker compose run --rm tradingagents -t SPY -d 2026-01-15 --clear-checkpoints
+
+# Run unattended but skip the final consolidated report tree
+docker compose run --rm tradingagents -t SPY --no-save
 
 # Pre-fill just the ticker but keep the wizard for everything else
 docker compose run --rm tradingagents --ticker TSLA   # still unattended (— ticker triggers it)
@@ -148,8 +152,9 @@ Two things are written per run:
   `<TRADINGAGENTS_RESULTS_DIR>/<ticker>/<analysis_date>/` (defaults to
   `~/.tradingagents/logs/...`).
 - The consolidated final report. In an unattended run it auto-saves to
-  `reports/<ticker>_<timestamp>/` under the working directory; in interactive
-  mode you are prompted for the path (this default is offered).
+  `reports/<ticker>_<timestamp>/` under the working directory unless you pass
+  `--no-save`; in interactive mode you are prompted for the path unless you pass
+  `--save` or `--no-save`.
 
 Under Docker, bind-mount a host directory so these survive the container and are
 visible on the host. For example, add a `docker-compose.override.yml`:
