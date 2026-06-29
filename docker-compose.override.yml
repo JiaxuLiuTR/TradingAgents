@@ -37,16 +37,16 @@
 services:
   tradingagents:
     volumes:
-      - ./certs/cacert-combined.pem:/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem:ro
+      # - ./certs/cacert-combined.pem:/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem:ro
       # Auto outputs: logs/, per-section reports/, memory/, cache/ on the host.
       - ./output:/home/appuser/.tradingagents
       # Final consolidated report (prompt default is <cwd>/reports). Same host
       # folder, so accepting the default save lands in ./output/<ticker>_<ts>/.
       - ./output:/home/appuser/app/reports
     environment:
-      - CURL_CA_BUNDLE=/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem
-      - REQUESTS_CA_BUNDLE=/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem
-      - SSL_CERT_FILE=/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem
+      # - CURL_CA_BUNDLE=/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem
+      # - REQUESTS_CA_BUNDLE=/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem
+      # - SSL_CERT_FILE=/opt/venv/lib/python3.12/site-packages/certifi/cacert.pem
       # Output paths (these match the ./output bind mounts above; the first is
       # also the built-in default). Change them to relocate within a mounted
       # dir without touching code.
